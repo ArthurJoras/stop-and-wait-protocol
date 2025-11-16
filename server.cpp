@@ -15,6 +15,12 @@
 #define RECEIVED_DIR "received_files"
 #define MAX_CLIENTS 10
 #define QUEUE_SIZE 100
+#define DATA_SIZE (BUFLEN - sizeof(packet_header_t))
+
+typedef struct {
+	unsigned char seq_num;  // 0 ou 1
+	unsigned short checksum;
+} packet_header_t;
 typedef struct {
 	char data[BUFLEN];
 	int length;
@@ -34,6 +40,7 @@ typedef struct {
 	packet_queue_t* queue;
 	int socket;
 	bool active;
+	unsigned char expected_seq;
 } client_info_t;
 typedef struct {
 	client_info_t clients[MAX_CLIENTS];
@@ -46,6 +53,18 @@ client_manager_t client_manager = {.num_clients = 0};
 void die(const char* s) {
 	perror(s);
 	exit(1);
+}
+
+unsigned short calculate_checksum(const char* data, size_t length) {
+	unsigned int sum = 0;
+	for (size_t i = 0; i < length; i++) {
+		sum += (unsigned char)data[i];
+	}
+	// Fold 32-bit sum to 16 bits
+	while (sum >> 16) {
+		sum = (sum & 0xFFFF) + (sum >> 16);
+	}
+	return (unsigned short)~sum;
 }
 void initQueue(packet_queue_t* queue) {
 	queue->head = 0;
@@ -176,6 +195,7 @@ void* handle_client(void* arg) {
 	FILE* file = createAndOpenFile(info->filename);
 	size_t totalBytesWritten = 0;
 	int packetCount = 0;
+	info->expected_seq = 0;
 
 	while (true) {
 		dequeue(info->queue, &packet);
@@ -184,28 +204,47 @@ void* handle_client(void* arg) {
 			continue;
 		}
 
-		packetCount++;
-		printf("[Thread %lu] Packet #%d (%d bytes)\n", pthread_self(), packetCount, packet.length);
+		packet_header_t* header = (packet_header_t*)packet.data;
+		char* data_ptr = packet.data + sizeof(packet_header_t);
+		size_t data_length = packet.length - sizeof(packet_header_t);
 
-		size_t bytesWritten = fwrite(packet.data, 1, packet.length, file);
-		if (bytesWritten != packet.length) {
-			perror("Error writing to file");
-			break;
-		}
-		totalBytesWritten += bytesWritten;
-
-		char ack[] = "ACK";
 		int slen = sizeof(info->client_addr);
-		if (sendto(info->socket, ack, strlen(ack), 0,
-		           (struct sockaddr*)&info->client_addr, slen) == -1) {
-			perror("Error sending ACK");
-			break;
+
+		// Validar checksum
+		unsigned short calculated_checksum = calculate_checksum(data_ptr, data_length);
+		if (calculated_checksum != header->checksum) {
+			printf("[Thread %lu] Checksum error! Discarding packet\n", pthread_self());
+			continue;  // Não envia ACK para forçar retransmissão
 		}
 
-		if (packet.length < BUFLEN) {
-			printf("[Thread %lu] Transfer complete. Total: %zu bytes\n",
-			       pthread_self(), totalBytesWritten);
-			break;
+		// Verificar número de sequência
+		if (header->seq_num == info->expected_seq) {
+			// Pacote correto e na ordem
+			packetCount++;
+			printf("[Thread %lu] Packet #%d (seq=%d, %zu bytes)\n",
+			       pthread_self(), packetCount, header->seq_num, data_length);
+
+			size_t bytesWritten = fwrite(data_ptr, 1, data_length, file);
+			if (bytesWritten != data_length) {
+				perror("Error writing to file");
+				break;
+			}
+			totalBytesWritten += bytesWritten;
+
+			// Envia ACK e alterna sequência esperada
+			sendAck(info->socket, &info->client_addr, slen, info->expected_seq);
+			info->expected_seq = 1 - info->expected_seq;  // Alterna entre 0 e 1
+
+			if (data_length < DATA_SIZE) {
+				printf("[Thread %lu] Transfer complete. Total: %zu bytes\n",
+				       pthread_self(), totalBytesWritten);
+				break;
+			}
+		} else {
+			// Pacote duplicado - envia ACK mas não escreve no arquivo
+			printf("[Thread %lu] Duplicate packet (seq=%d, expected=%d). Sending ACK anyway\n",
+			       pthread_self(), header->seq_num, info->expected_seq);
+			sendAck(info->socket, &info->client_addr, slen, header->seq_num);
 		}
 	}
 
@@ -218,9 +257,10 @@ void* handle_client(void* arg) {
 	pthread_exit(NULL);
 }
 
-void sendAck(int socket, struct sockaddr_in* dest, int dest_len) {
-	char ack[] = "ACK";
-	if (sendto(socket, ack, strlen(ack), 0, (struct sockaddr*)dest, dest_len) == -1) {
+void sendAck(int socket, struct sockaddr_in* dest, int dest_len, unsigned char seq_num) {
+	char ack[2];
+	ack[0] = seq_num;
+	if (sendto(socket, ack, 1, 0, (struct sockaddr*)dest, dest_len) == -1) {
 		perror("Error sending ACK for filename");
 	}
 }
@@ -302,7 +342,7 @@ void* packetDispatcher(void* arg) {
 
 			printClientInfo(&from_addr, filename);
 
-			sendAck(socket, &from_addr, fromlen);
+			sendAck(socket, &from_addr, fromlen, 0xFF);
 
 			createClient(socket, &from_addr, filename);
 		} else {

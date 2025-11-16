@@ -14,17 +14,36 @@
 #define TIMEOUT 5000
 #define MAX_RETRIES 5
 #define FILENAME_PACKET 0xFF
+#define DATA_SIZE (BUFLEN - sizeof(packet_header_t))
+
+typedef struct {
+	unsigned char seq_num;  // 0 ou 1
+	unsigned short checksum;
+} packet_header_t;
 
 typedef struct {
 	int socket;
 	struct sockaddr_in server_addr;
 	FILE* file;
 	char* filename;
+	unsigned char current_seq;
 } transfer_info_t;
 
 void die(const char* s) {
 	perror(s);
 	exit(1);
+}
+
+unsigned short calculate_checksum(const char* data, size_t length) {
+	unsigned int sum = 0;
+	for (size_t i = 0; i < length; i++) {
+		sum += (unsigned char)data[i];
+	}
+	// Fold 32-bit sum to 16 bits
+	while (sum >> 16) {
+		sum = (sum & 0xFFFF) + (sum >> 16);
+	}
+	return (unsigned short)~sum;
 }
 
 FILE* openFile(const char* filename) {
@@ -61,7 +80,7 @@ void setSocketTimeout(int socket) {
 	setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 }
 
-int sendWithRetry(int socket, const char* data, size_t length, struct sockaddr_in* dest, int dest_len) {
+int sendWithRetry(int socket, const char* data, size_t length, struct sockaddr_in* dest, int dest_len, unsigned char expected_seq) {
 	int retries = 0;
 	int acknowledged = 0;
 
@@ -77,8 +96,11 @@ int sendWithRetry(int socket, const char* data, size_t length, struct sockaddr_i
 		if (recvLen == -1) {
 			retries++;
 			printf("Timeout, retrying... (%d/%d)\n", retries, MAX_RETRIES);
-		} else {
+		} else if (recvLen > 0 && ackBuf[0] == expected_seq) {
 			acknowledged = 1;
+		} else {
+			printf("Received wrong ACK, retrying...\n");
+			retries++;
 		}
 	}
 
@@ -93,7 +115,7 @@ int sendFilename(int socket, const char* filename, struct sockaddr_in* server_ad
 	size_t packet_len = strlen(filename) + 2;
 	printf("Sending filename: %s\n", filename);
 
-	if (!sendWithRetry(socket, filenameBuf, packet_len, server_addr, slen)) {
+	if (!sendWithRetry(socket, filenameBuf, packet_len, server_addr, slen, 0xFF)) {
 		fprintf(stderr, "Failed to send filename after maximum retries\n");
 		return 0;
 	}
@@ -113,9 +135,14 @@ void* sendFileThread(void* arg) {
 		pthread_exit(NULL);
 	}
 
+	info->current_seq = 0;
+
 	while (!finishedFile) {
-		size_t bytesRead = fread(buf, 1, BUFLEN, info->file);
-		if (bytesRead < BUFLEN) {
+		packet_header_t* header = (packet_header_t*)buf;
+		char* data_ptr = buf + sizeof(packet_header_t);
+
+		size_t bytesRead = fread(data_ptr, 1, DATA_SIZE, info->file);
+		if (bytesRead < DATA_SIZE) {
 			if (feof(info->file)) {
 				finishedFile = 1;
 			} else {
@@ -123,13 +150,19 @@ void* sendFileThread(void* arg) {
 			}
 		}
 
-		packetCount++;
-		printf("Sending packet #%d (%zu bytes)\n", packetCount, bytesRead);
+		header->seq_num = info->current_seq;
+		header->checksum = calculate_checksum(data_ptr, bytesRead);
 
-		if (!sendWithRetry(info->socket, buf, bytesRead, &info->server_addr, slen)) {
+		packetCount++;
+		printf("Sending packet #%d (seq=%d, %zu bytes)\n", packetCount, info->current_seq, bytesRead);
+
+		size_t packet_len = sizeof(packet_header_t) + bytesRead;
+		if (!sendWithRetry(info->socket, buf, packet_len, &info->server_addr, slen, info->current_seq)) {
 			fprintf(stderr, "Failed to receive acknowledgment after maximum retries\n");
 			pthread_exit(NULL);
 		}
+
+		info->current_seq = 1 - info->current_seq;  // Alterna entre 0 e 1
 	}
 
 	printf("File sent successfully (%d packets)\n", packetCount);
@@ -159,6 +192,7 @@ int main(int argc, char* argv[]) {
 	info->server_addr = si_other;
 	info->file = file;
 	info->filename = basename(argv[1]);
+	info->current_seq = 0;
 
 	pthread_t thread_id;
 	printf("Starting file transfer thread...\n");
