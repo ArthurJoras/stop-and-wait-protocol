@@ -96,10 +96,11 @@ int sendWithRetry(int socket, const char* data, size_t length, struct sockaddr_i
 		if (recvLen == -1) {
 			retries++;
 			printf("Timeout, retrying... (%d/%d)\n", retries, MAX_RETRIES);
-		} else if (recvLen > 0 && ackBuf[0] == expected_seq) {
+		} else if (recvLen > 0 && (unsigned char)ackBuf[0] == expected_seq) {
 			acknowledged = 1;
 		} else {
-			printf("Received wrong ACK, retrying...\n");
+			printf("Received wrong ACK (got 0x%02X, expected 0x%02X), retrying...\n",
+			       (unsigned char)ackBuf[0], expected_seq);
 			retries++;
 		}
 	}

@@ -164,6 +164,14 @@ FILE* createAndOpenFile(const char* filename) {
 	return file;
 }
 
+void sendAck(int socket, struct sockaddr_in* dest, int dest_len, unsigned char seq_num) {
+	char ack[2];
+	ack[0] = seq_num;
+	if (sendto(socket, ack, 1, 0, (struct sockaddr*)dest, dest_len) == -1) {
+		perror("Error sending ACK for filename");
+	}
+}
+
 int createSocket() {
 	int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (s == -1) {
@@ -257,14 +265,6 @@ void* handle_client(void* arg) {
 	pthread_exit(NULL);
 }
 
-void sendAck(int socket, struct sockaddr_in* dest, int dest_len, unsigned char seq_num) {
-	char ack[2];
-	ack[0] = seq_num;
-	if (sendto(socket, ack, 1, 0, (struct sockaddr*)dest, dest_len) == -1) {
-		perror("Error sending ACK for filename");
-	}
-}
-
 void printClientInfo(struct sockaddr_in* client_addr, const char* filename) {
 	printf("\n=== New client connected ===\n");
 	printf("Client: %s:%d\n", inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port));
@@ -340,11 +340,15 @@ void* packetDispatcher(void* arg) {
 			strncpy(filename, buf + 1, recv_len - 1);
 			filename[recv_len - 1] = '\0';
 
-			printClientInfo(&from_addr, filename);
+			// Verificar se cliente já existe (retry do filename)
+			client_info_t* existing = findClient(&from_addr);
+			if (existing == NULL) {
+				printClientInfo(&from_addr, filename);
+				createClient(socket, &from_addr, filename);
+			}
 
+			// Sempre envia ACK (mesmo se for retry)
 			sendAck(socket, &from_addr, fromlen, 0xFF);
-
-			createClient(socket, &from_addr, filename);
 		} else {
 			client_info_t* client = findClient(&from_addr);
 			if (client != NULL) {
